@@ -1,1 +1,5 @@
-vb
+# Проверка TikTok
+        for username in STREAMERS.get("tiktok", []):
+            if is_live("tiktok", username):
+                record_stream("tiktok", username)
+            time.sleep(2)
