@@ -1,0 +1,191 @@
+import subprocess
+import time
+import os
+from datetime import datetime
+import json
+import sys
+import threading
+import logging
+
+# ==================== НАСТРОЙКИ ====================
+STREAMERS = {
+    "twitch": ["bugorpro", "mafanyaking", "kussia88", "n3koglai", "cirilla04", "lenyapudge"],
+    "kick": ["kussia88", "mafanyatopeu", "punsh1k", "m0neyglai", "frustyle420"],
+    "tiktok": ["kolyaka_stream", "moneyglai4ik"],
+}
+
+QUALITY = "best"
+BASE_FOLDER = r"C:\Users\voise\TwichRecorder"
+SAVE_FOLDER = os.path.join(BASE_FOLDER, "Videos")
+
+TWITCH_CHECK_INTERVAL = 300    
+KICK_CHECK_INTERVAL = 900  
+TIKTOK_CHECK_INTERVAL = 300    
+
+# ==================== ЛОГИРОВАНИЕ ====================
+logging.basicConfig(
+    filename=os.path.join(BASE_FOLDER, 'recorder.log'),
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    encoding='utf-8',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+console = logging.StreamHandler(sys.stdout)
+console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
+
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+active_recordings = set()
+
+
+def is_live(platform, username):
+    try:
+        if platform == "twitch":
+            url = f"https://www.twitch.tv/{username}"
+        elif platform == "kick":
+            url = f"https://kick.com/{username}"
+        elif platform == "tiktok":
+            url = f"https://www.tiktok.com/@{username}/live"
+        else:
+            return False
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Проверка {platform}/{username}...")
+
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+        result = subprocess.run(
+            ["streamlink", url, "--json", "--http-timeout", "60"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            encoding='utf-8',
+            startupinfo=startupinfo,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                data = json.loads(result.stdout)
+                if data.get("streams"):
+                    print(f"   ✅ {platform}/{username} — СТРИМ ИДЁТ!")
+                    logging.info(f"Стрим онлайн: {platform}/{username}")
+                    return True
+            except:
+                pass
+
+        print(f"   ❌ {platform}/{username} — оффлайн")
+        return False
+
+    except Exception as e:
+        print(f"   ❌ Ошибка проверки {platform}/{username}: {e}")
+        logging.error(f"Ошибка проверки {platform}/{username}: {e}")
+        return False
+
+
+def record_stream(platform, username):
+    key = (platform, username.lower())
+    if key in active_recordings:
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{platform}_{username}_{timestamp}.mp4"
+    output_path = os.path.join(SAVE_FOLDER, filename)
+
+    if platform == "twitch":
+        url = f"https://www.twitch.tv/{username}"
+    elif platform == "kick":
+        url = f"https://kick.com/{username}"
+    elif platform == "tiktok":
+        url = f"https://www.tiktok.com/@{username}/live"
+
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🎥 Запуск записи → {platform.upper()} | {username}")
+    logging.info(f"Запуск записи: {platform}/{username} → {filename}")
+
+    try:
+        cmd = ["streamlink", url, QUALITY, "--output", output_path]
+        process = subprocess.Popen(cmd)
+        active_recordings.add(key)
+        if platform == "tiktok":
+            cmd = ["streamlink", url, QUALITY, "--output", output_path,
+                   "--hls-segment-timeout", "30", "--hls-playlist-timeout", "60"]
+        else:
+            cmd = ["streamlink", url, QUALITY, "--output", output_path]
+
+
+        def monitor():
+            process.wait()
+            active_recordings.discard(key)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏹️ Запись {username} завершена")
+            logging.info(f"Запись завершена: {platform}/{username}")
+
+            time.sleep(3)
+            if is_live(platform, username):
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Стрим продолжается — запускаем новую запись...")
+                logging.info(f"Стрим всё ещё идёт — перезапуск записи {username}")
+                record_stream(platform, username)   
+            else:
+                logging.info(f"Стрим {username} завершился") # Автоматический remux
+            try:
+                fixed_path = output_path.replace(".mp4", "_fixed.mp4")
+                subprocess.run([
+                    "ffmpeg", "-i", output_path,
+                    "-c", "copy", "-movflags", "+faststart",
+                    fixed_path
+                ], check=True, timeout=300, creationflags=subprocess.CREATE_NO_WINDOW)
+                
+                os.replace(fixed_path, output_path)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Remux завершён (перемотка работает)")
+            except Exception as remux_err:
+                logging.error(f"Ошибка remux {filename}: {remux_err}")
+
+        threading.Thread(target=monitor, daemon=True).start()
+
+    except Exception as e:
+        logging.error(f"Ошибка запуска записи {username}: {e}")
+        print(f"❌ Ошибка запуска записи {username}: {e}")
+        active_recordings.discard(key)
+
+
+# ==================== ЗАПУСК ====================
+if __name__ == "__main__":
+    logging.info("Автозаписыватель запущен")
+
+    last_kick_check = 0
+
+    while True:
+        try:
+            current_time = time.time()
+
+            # Проверка Twitch
+            for username in STREAMERS.get("twitch", []):
+                if is_live("twitch", username):
+                    record_stream("twitch", username)
+                time.sleep(2)
+
+            # Проверка TikTok
+            for username in STREAMERS.get("tiktok", []):
+                if is_live("tiktok", username):
+                    record_stream("tiktok", username)
+                time.sleep(2)
+
+            # Проверка Kick (реже)
+            if current_time - last_kick_check > KICK_CHECK_INTERVAL:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Проверка Kick...")
+                for username in STREAMERS.get("kick", []):
+                    if is_live("kick", username):
+                        record_stream("kick", username)
+                    time.sleep(3)
+                last_kick_check = current_time
+
+            time.sleep(60)  # основной цикл каждую минуту
+
+        except KeyboardInterrupt:
+            print("\n🛑 Скрипт остановлен.")
+            logging.info("Скрипт остановлен пользователем")
+            break
+        except Exception as e:
+            logging.error(f"Критическая ошибка в главном цикле: {e}")
+            time.sleep(10)
