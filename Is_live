@@ -1,0 +1,163 @@
+def is_live(self, platform, username):
+    """Проверить, идёт ли стрим (с особой логикой для TikTok)"""
+    try:
+        url = self.get_url(platform, username)
+        if not url:
+            return False
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔍 Проверка {platform}/{username}...")
+
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+        # ============ ОСОБАЯ ЛОГИКА ДЛЯ TIKTOK ============
+        if platform == "tiktok":
+            # Для TikTok используем более агрессивную проверку с таймаутами
+            # и проверяем не только наличие потоков, но и их актуальность
+            
+            # 1. Сначала проверяем через streamlink с принудительным обновлением кеша
+            cmd = [
+                "streamlink", 
+                url, 
+                "--json",
+                "--hls-segment-timeout", "10",    # Быстрый таймаут на сегменты
+                "--hls-playlist-timeout", "15",    # Быстрый таймаут на плейлист
+                "--hls-live-edge", "1"             # Минимальное количество сегментов
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,  # Общий таймаут меньше чем для других платформ
+                encoding='utf-8',
+                errors='ignore',
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            # Анализируем результат для TikTok
+            if result.returncode == 0 and result.stdout.strip():
+                try:
+                    data = json.loads(result.stdout)
+                    streams = data.get("streams")
+                    
+                    # Для TikTok проверяем что streams - это словарь с ключами
+                    if streams and isinstance(streams, dict) and len(streams) > 0:
+                        # Дополнительная проверка: есть ли ключи с качеством
+                        stream_keys = list(streams.keys())
+                        # Игнорируем пустые или служебные ключи
+                        valid_streams = [k for k in stream_keys if k and not k.startswith("_")]
+                        
+                        if valid_streams:
+                            print(f"   {Colors.GREEN}✅ {platform}/{username} — СТРИМ ИДЁТ!{Colors.RESET}")
+                            logging.info(f"Стрим онлайн: {platform}/{username}")
+                            return True
+                except json.JSONDecodeError:
+                    pass
+            
+            # Если не получили валидный JSON, проверяем stderr
+            if result.stderr:
+                stderr = result.stderr.lower()
+                # Для TikTok характерные сообщения об оффлайне
+                if "offline" in stderr or "no stream found" in stderr or "unable to play" in stderr:
+                    print(f"   {Colors.RED}❌ {platform}/{username} — оффлайн{Colors.RESET}")
+                    return False
+                # Если ошибка не связана с оффлайном, пробуем второй способ
+                elif "error" not in stderr:
+                    # Возможно стрим онлайн, но streamlink не может захватить
+                    # Пробуем альтернативный метод
+                    pass
+            
+            # ============ АЛЬТЕРНАТИВНАЯ ПРОВЕРКА ДЛЯ TIKTOK ============
+            # Если streamlink не дал четкого ответа, пробуем проверить через прямой запрос
+            print(f"   {Colors.YELLOW}⚠️ Альтернативная проверка для {username}...{Colors.RESET}")
+            
+            # Проверяем через короткий захват 1 сегмента (без записи файла)
+            test_cmd = [
+                "streamlink", 
+                url, 
+                "worst",  # Берем самое низкое качество для скорости
+                "--hls-segment-timeout", "5",
+                "--hls-playlist-timeout", "10",
+                "--hls-live-edge", "1",
+                "--stream-timeout", "3",  # Ждем только 3 секунды данных
+                "-o", "NUL"  # В Windows отправляем в никуда
+            ]
+            
+            try:
+                test_result = subprocess.run(
+                    test_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    encoding='utf-8',
+                    errors='ignore',
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                
+                # Если streamlink начал передавать данные, стрим идет
+                if test_result.returncode == 0 or "[download]" in test_result.stderr.lower():
+                    print(f"   {Colors.GREEN}✅ {platform}/{username} — СТРИМ ИДЁТ! (альтернативная проверка){Colors.RESET}")
+                    logging.info(f"Стрим онлайн: {platform}/{username} (альт. проверка)")
+                    return True
+                    
+            except subprocess.TimeoutExpired:
+                # Таймаут может означать что стрим есть, но медленно отвечает
+                # В случае TikTok часто означает что стрим оффлайн
+                print(f"   {Colors.RED}❌ {platform}/{username} — оффлайн (таймаут){Colors.RESET}")
+                return False
+            except Exception as e:
+                logging.debug(f"Альтернативная проверка TikTok для {username} завершилась с ошибкой: {e}")
+            
+            # Если все проверки не дали результата - считаем оффлайн
+            print(f"   {Colors.RED}❌ {platform}/{username} — оффлайн{Colors.RESET}")
+            return False
+        
+        # ============ СТАНДАРТНАЯ ПРОВЕРКА ДЛЯ ДРУГИХ ПЛАТФОРМ ============
+        else:
+            # Для Twitch и Kick используем стандартную проверку
+            result = subprocess.run(
+                ["streamlink", url, "--json"],
+                capture_output=True,
+                text=True,
+                timeout=25,
+                encoding='utf-8',
+                errors='ignore',
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                try:
+                    data = json.loads(result.stdout)
+                    if data.get("streams"):
+                        print(f"   {Colors.GREEN}✅ {platform}/{username} — СТРИМ ИДЁТ!{Colors.RESET}")
+                        logging.info(f"Стрим онлайн: {platform}/{username}")
+                        return True
+                except json.JSONDecodeError as e:
+                    logging.error(f"Ошибка парсинга JSON для {platform}/{username}: {e}")
+                    return False
+
+            if result.stderr:
+                stderr = result.stderr.lower()
+                if "offline" in stderr or "not found" in stderr:
+                    print(f"   {Colors.RED}❌ {platform}/{username} — оффлайн{Colors.RESET}")
+                    return False
+                elif "error" in stderr:
+                    logging.error(f"Streamlink ошибка для {platform}/{username}: {result.stderr[:200]}")
+                    return False
+
+            print(f"   {Colors.RED}❌ {platform}/{username} — оффлайн{Colors.RESET}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print(f"   {Colors.YELLOW}⚠️ Таймаут проверки {platform}/{username}{Colors.RESET}")
+        logging.warning(f"Таймаут проверки {platform}/{username}")
+        return False
+    except Exception as e:
+        print(f"   {Colors.RED}❌ Ошибка проверки {platform}/{username}: {e}{Colors.RESET}")
+        logging.error(f"Ошибка проверки {platform}/{username}: {e}")
+        return False
