@@ -1,0 +1,366 @@
+import subprocess
+import time
+import os
+from datetime import datetime
+import json
+import sys
+import threading
+import logging
+import shutil
+
+# ==================== НАСТРОЙКИ ====================
+STREAMERS = {
+    "twitch": ["mafanyaking", "kussia88", "n3koglai", "cirilla04"],
+    "kick": ["kussia88", "mafanyatopeu", "m0neyglai"]                  
+}
+
+QUALITY = "best"
+BASE_FOLDER = r"C:\Users\voise\TwitchRecorder"
+SAVE_FOLDER = os.path.join(BASE_FOLDER, "Videos")
+MIN_RESTART_INTERVAL = 300
+CHECK_INTERVAL = 60
+
+PLATFORM_CONFIG = {
+    "twitch": {
+        "url_template": "https://www.twitch.tv/{username}",
+        "extra_args": ["--twitch-disable-ads", "--hls-segment-threads", "1"]
+    },
+    "kick": {
+        "url_template": "https://kick.com/{username}",
+        "extra_args": ["--hls-segment-threads", "1"]
+    }
+}
+
+# ==================== ЦВЕТА ====================
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    PURPLE = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+# ==================== ЛОГИРОВАНИЕ ====================
+os.makedirs(BASE_FOLDER, exist_ok=True)
+
+logging.basicConfig(
+    filename=os.path.join(BASE_FOLDER, 'recorder.log'),
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    encoding='utf-8',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+class ColoredConsoleHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream  # <--- ЭТО ГЛАВНОЕ
+            
+            if record.levelno == logging.INFO:
+                stream.write(f"{Colors.WHITE}{msg}{Colors.RESET}\n")
+            elif record.levelno == logging.WARNING:
+                stream.write(f"{Colors.YELLOW}{msg}{Colors.RESET}\n")
+            elif record.levelno == logging.ERROR:
+                stream.write(f"{Colors.RED}{msg}{Colors.RESET}\n")
+            else:
+                stream.write(f"{msg}\n")
+            stream.flush()
+        except Exception:
+            self.handleError(record)
+
+console = ColoredConsoleHandler(sys.stdout)
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+logging.getLogger('').addHandler(console)
+
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# ==================== ОСНОВНОЙ КЛАСС ====================
+class StreamRecorder:
+    def __init__(self):
+        self.active_recordings = {}
+        self.last_restart_time = {}
+        self.lock = threading.Lock()
+        self.running = True
+        self.ffmpeg_available = self._check_tool("ffmpeg", "--version")
+        self.streamlink_available = self._check_tool("streamlink", "--version")
+        
+        if not self.streamlink_available:
+            logging.error("Streamlink не найден! Установите: pip install streamlink")
+            sys.exit(1)
+        
+        if not self.ffmpeg_available:
+            logging.warning("FFmpeg не найден! Remux будет пропущен")
+    
+    def _check_tool(self, tool, arg):
+        try:
+            subprocess.run([tool, arg], capture_output=True, 
+                          creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+            return True
+        except:
+            return False
+    
+    def _get_startupinfo(self):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        return startupinfo
+    
+    def get_url(self, platform, username):
+        config = PLATFORM_CONFIG.get(platform)
+        return config["url_template"].format(username=username) if config else None
+    
+    def get_extra_args(self, platform):
+        config = PLATFORM_CONFIG.get(platform)
+        return config.get("extra_args", []) if config else []
+    
+    def check_disk_space(self, required_bytes=1024*1024*1024):
+        try:
+            free_space = shutil.disk_usage(SAVE_FOLDER).free
+            return free_space >= required_bytes, free_space
+        except Exception as e:
+            logging.warning(f"Не удалось проверить место: {e}")
+            return True, 0
+    
+    def is_live(self, platform, username):
+        try:
+            url = self.get_url(platform, username)
+            if not url:
+                return False
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔍 Проверка {platform}/{username}...")
+            
+            result = subprocess.run(
+                ["streamlink", url, "--json"],
+                capture_output=True,
+                text=True,
+                timeout=25,
+                encoding='utf-8',
+                errors='ignore',
+                startupinfo=self._get_startupinfo(),
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                if data.get("streams"):
+                    print(f"   {Colors.GREEN}✅ {platform}/{username} — СТРИМ ИДЁТ!{Colors.RESET}")
+                    logging.info(f"Стрим онлайн: {platform}/{username}")
+                    return True
+            
+            print(f"   {Colors.RED}❌ {platform}/{username} — оффлайн{Colors.RESET}")
+            return False
+            
+        except Exception as e:
+            print(f"   {Colors.YELLOW}⚠️ Ошибка проверки {platform}/{username}: {e}{Colors.RESET}")
+            logging.error(f"Ошибка проверки {platform}/{username}: {e}")
+            return False
+    
+    def start_recording(self, platform, username, is_continuation=False):
+        key = (platform, username.lower())
+        
+        with self.lock:
+            if key in self.active_recordings:
+                return
+            
+            if is_continuation and not self._can_restart(key):
+                logging.info(f"Пропущен перезапуск {username} (защита от частых перезапусков)")
+                return
+        
+        has_space, free_space = self.check_disk_space()
+        if not has_space:
+            logging.error(f"Недостаточно места для {username} (свободно: {free_space//(1024**3)} ГБ)")
+            return
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"{platform}_{username}_{timestamp}.mp4"
+        output_path = os.path.join(SAVE_FOLDER, filename)
+        
+        url = self.get_url(platform, username)
+        if not url:
+            logging.error(f"Неизвестная платформа: {platform}")
+            return
+        
+        cmd = ["streamlink", url, QUALITY, "--output", output_path]
+        cmd.extend(self.get_extra_args(platform))
+        
+        logging.info(f"Запуск записи: {platform}/{username} → {filename}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.GREEN}🎥 Запуск записи → {platform.upper()} | {username}{Colors.RESET}")
+        
+        try:
+            process = subprocess.Popen(
+                cmd,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='ignore'
+            )
+            
+            with self.lock:
+                self.active_recordings[key] = {
+                    "process": process,
+                    "start_time": time.time(),
+                    "output_path": output_path,
+                    "filename": filename,
+                    "platform": platform,
+                    "username": username
+                }
+            
+            threading.Thread(target=self._monitor_recording, args=(key,), daemon=True).start()
+            
+        except Exception as e:
+            logging.error(f"Ошибка запуска {username}: {e}")
+            with self.lock:
+                self.active_recordings.pop(key, None)
+    
+    def _can_restart(self, key):
+        with self.lock:
+            last_time = self.last_restart_time.get(key, 0)
+            if time.time() - last_time < MIN_RESTART_INTERVAL:
+                return False
+            self.last_restart_time[key] = time.time()
+            return True
+    
+    def _monitor_recording(self, key):
+        with self.lock:
+            info = self.active_recordings.get(key)
+            if not info:
+                return
+        
+        process = info["process"]
+        output_path = info["output_path"]
+        filename = info["filename"]
+        platform = info["platform"]
+        username = info["username"]
+        
+        try:
+            exit_code = process.wait(timeout=86400)
+        except subprocess.TimeoutExpired:
+            logging.warning(f"Запись {username} превысила лимит")
+            process.terminate()
+            process.wait(timeout=10)
+            exit_code = -1
+        except Exception as e:
+            logging.error(f"Ошибка мониторинга {username}: {e}")
+            exit_code = -1
+        
+        with self.lock:
+            self.active_recordings.pop(key, None)
+        
+        logging.info(f"Запись завершена: {platform}/{username} (код: {exit_code})")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}⏹️ Запись {username} завершена{Colors.RESET}")
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            if self.ffmpeg_available:
+                self._process_recorded_file(output_path, filename)
+        else:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+                logging.info(f"Удален пустой файл: {filename}")
+        
+        if self.running:
+            self._check_continuation(platform, username)
+    
+    def _process_recorded_file(self, output_path, filename):
+        fixed_path = None
+        try:
+            fixed_path = output_path.replace(".mp4", "_fixed.mp4")
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.CYAN}🔄 Remux: {filename}{Colors.RESET}")
+            
+            subprocess.run(
+                ["ffmpeg", "-i", output_path, "-c", "copy", "-movflags", "+faststart", "-y", fixed_path],
+                check=True,
+                timeout=300,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore'
+            )
+            
+            os.remove(output_path)
+            os.rename(fixed_path, output_path)
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.GREEN}✅ Remux завершён: {filename}{Colors.RESET}")
+            logging.info(f"Remux успешен: {filename}")
+            
+        except Exception as e:
+            logging.error(f"Ошибка remux {filename}: {e}")
+            if fixed_path and os.path.exists(fixed_path):
+                os.remove(fixed_path)
+    
+    def _check_continuation(self, platform, username):
+        time.sleep(5)
+        if not self.running:
+            return
+        
+        if self.is_live(platform, username):
+            logging.info(f"Стрим {username} снова онлайн, перезапуск...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.PURPLE}🔄 Перезапуск {username}{Colors.RESET}")
+            self.start_recording(platform, username, is_continuation=True)
+    
+    def check_and_record_all(self):
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {Colors.BOLD}🔍 Проверка стримеров...{Colors.RESET}")
+        
+        for platform, usernames in STREAMERS.items():
+            for username in usernames:
+                if not self.running:
+                    return
+                if self.is_live(platform, username):
+                    self.start_recording(platform, username)
+                time.sleep(1.5)
+        
+        with self.lock:
+            if self.active_recordings:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.GREEN}📺 Активных записей: {len(self.active_recordings)}{Colors.RESET}")
+                for key, info in self.active_recordings.items():
+                    duration = time.time() - info["start_time"]
+                    print(f"   {Colors.CYAN}▶️ {info['platform']}/{info['username']} ({int(duration//3600):02d}:{int((duration%3600)//60):02d}:{int(duration%60):02d}){Colors.RESET}")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {Colors.YELLOW}⏸️ Нет активных записей{Colors.RESET}")
+    
+    def stop_all_recordings(self):
+        self.running = False
+        with self.lock:
+            for key, info in list(self.active_recordings.items()):
+                try:
+                    process = info["process"]
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=5)
+                    logging.info(f"Остановлена запись: {info['username']}")
+                except Exception as e:
+                    logging.error(f"Ошибка остановки {info.get('username', 'unknown')}: {e}")
+            self.active_recordings.clear()
+    
+    def run(self):
+        logging.info("Сервис записи запущен")
+        print(f"{Colors.BOLD}{Colors.GREEN}=== СЕРВИС ЗАПИСИ СТРИМОВ ЗАПУЩЕН ==={Colors.RESET}")
+        print(f"{Colors.YELLOW}Нажмите Ctrl+C для остановки{Colors.RESET}\n")
+        
+        try:
+            while self.running:
+                self.check_and_record_all()
+                for _ in range(CHECK_INTERVAL):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            logging.info("Получен сигнал остановки")
+            print(f"\n{Colors.YELLOW}Остановка...{Colors.RESET}")
+        finally:
+            self.stop_all_recordings()
+            logging.info("Сервис остановлен")
+            print(f"{Colors.GREEN}Сервис остановлен{Colors.RESET}")
+
+# ==================== ЗАПУСК ====================
+if __name__ == "__main__":
+    recorder = StreamRecorder()
+    recorder.run()
