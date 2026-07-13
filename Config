@@ -2,20 +2,18 @@ PLATFORM_CONFIG = {
     "twitch": {
         "url_template": "https://www.twitch.tv/{username}",
         "extra_args": [
-            "--twitch-disable-ads",
-            "--retry-streams", "10",
-            "--retry-open", "5",
-            "--hls-segment-threads", "3",
-            "--stream-timeout", "120"
+            "--twitch-disable-ads",      
+            "--retry-streams", "10",     
+            "--retry-open", "5",          
+            "--stream-timeout", "120"     
         ]
     },
     "kick": {
         "url_template": "https://kick.com/{username}",
         "extra_args": [
-            "--retry-streams", "10",
-            "--retry-open", "5",
-            "--hls-segment-threads", "3",
-            "--stream-timeout", "120"
+            "--retry-streams", "10",     
+            "--retry-open", "5",          
+            "--stream-timeout", "120"     
         ]
     }
 }
